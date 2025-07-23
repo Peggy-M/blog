@@ -361,15 +361,8 @@ result         = 00010010 00110100 01000100 01001100 (0x1234444C)
 
 ## Java 的 CopyOnWriteArrayList 和 Collections.synchronizedList 有什么区别？分别有什么优缺点？
 
-**CopyOnWriteArrayList**
+对于 `CopyOnWriteArrayList ` 与 `Collections.synchronizedList` 这两个集合而言两个本身都是属于线程安全的，但两者的使用场景存在较大的差异，对于 **CopyOnWriteArrayList ** 而言核心底层通过 `ReentantLock` 和数组变量副本来实现的。
 
- 
+当写数据的时候会通过 `lock`进行上锁，并通过 `getArray()` 方法获取当前数据的快照，并判断当前的新增值是否与旧值引用相同，从而避免因为想通过减少不必要的性能开销。通过写时赋值 `Object[] newElements = Arrays.copyOf(elements, len)` 将就的数组拷贝到新数组里面，然后通过 `setArray()` 方法进行原子性的更新数据引用。
 
-
-
-
-
-
-
-
-
+而对于 `Collections.synchronizedList` 而言
