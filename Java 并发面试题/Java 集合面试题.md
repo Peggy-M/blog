@@ -365,4 +365,98 @@ result         = 00010010 00110100 01000100 01001100 (0x1234444C)
 
 当写数据的时候会通过 `lock`进行上锁，并通过 `getArray()` 方法获取当前数据的快照，并判断当前的新增值是否与旧值引用相同，从而避免因为想通过减少不必要的性能开销。通过写时赋值 `Object[] newElements = Arrays.copyOf(elements, len)` 将就的数组拷贝到新数组里面，然后通过 `setArray()` 方法进行原子性的更新数据引用。
 
-而对于 `Collections.synchronizedList` 而言
+而对于 `Collections.synchronizedList` 而言，其本身就是一个工具类，通过该工具类将 List 集合转为`Collections`静态内部类线程安全的 `SynchronizedRandomAccessList` 或 `SynchronizedList` 集合主要去的区别在与是否实现了 `RandomAccess`接口。而这两个在最终的执行全部由父类下的 `SynchronizedCollection` 完成元素的获取和添加，最终对于的元素的添加通过 `synchronized` 修饰来实现线程安全。
+
+~~~ java
+static class SynchronizedCollection<E> implements Collection<E>, Serializable {
+    private static final long serialVersionUID = 3053995032091335093L;
+
+    public int size() {
+        synchronized (mutex) {return c.size();}
+    }
+
+    public boolean add(E e) {
+        synchronized (mutex) {return c.add(e);}
+    }
+    public boolean remove(Object o) {
+        synchronized (mutex) {return c.remove(o);}
+    }
+}
+~~~
+
+## Java ArrayList 的扩容机制是什么？
+
+ArrayList 关于容量有两部分核心的代码，首先第一部分是对于初始化阶段如果指定了容量大小，会优先使用指定的值作为默认的内部容器大小，否则会无参空构造来看，默认的容量对象是 `DEFAULTCAPACITY_EMPTY_ELEMENTDATA` 是一个 Object 的空数组。
+
+~~~ java
+public ArrayList(int initialCapacity) {
+    if (initialCapacity > 0) {
+        this.elementData = new Object[initialCapacity];
+    } else if (initialCapacity == 0) {
+        this.elementData = EMPTY_ELEMENTDATA;
+    } else {
+        throw new IllegalArgumentException("Illegal Capacity: "+
+                                           initialCapacity);
+    }
+}
+~~~
+
+~~~ java
+private static final Object[] DEFAULTCAPACITY_EMPTY_ELEMENTDATA = {};
+
+public ArrayList() {
+    this.elementData = DEFAULTCAPACITY_EMPTY_ELEMENTDATA;
+}
+~~~
+
+在 1.7 之后调整了初始化容量的时机，只有在第一次添加元素数据的时候，才会进行初始化数组容量的给定，返回其默认值 10 。
+
+~~~ java
+private static final int DEFAULT_CAPACITY = 10;
+
+if (elementData == DEFAULTCAPACITY_EMPTY_ELEMENTDATA) {
+	return Math.max(DEFAULT_CAPACITY, minCapacity);
+}
+~~~
+
+而当在继续添加元素的过程当中，如果其数组当中的元素数量等于数组长度的时候，就会执行 `grow()` 扩容方法，其具体的扩容步骤为代码所示
+
+~~~ java
+if (minCapacity - elementData.length > 0)
+~~~
+
+~~~ java
+
+private void grow(int minCapacity) {
+    // overflow-conscious code
+    //获取旧的数组长度
+    int oldCapacity = elementData.length;
+    //计算新的数组长度 = 旧容量 + 旧容量 >> 1 扩大为原理的 1.5 倍
+    int newCapacity = oldCapacity + (oldCapacity >> 1);
+    //如果扩容之后的还是小于添加元素之后的数量,则使用当前元素数量作为容器大小, 比如调用 addAll() 方法添加多个元素可能会出现这种情况
+    if (newCapacity - minCapacity < 0)
+        newCapacity = minCapacity;
+    //如果扩容之后的数量大于最大数组长度,进一步调用 hugeCapacity 方法进行其他的处理
+    if (newCapacity - MAX_ARRAY_SIZE > 0)
+        newCapacity = hugeCapacity(minCapacity);
+    // minCapacity is usually close to size, so this is a win:
+    //完成元素的拷贝
+    elementData = Arrays.copyOf(elementData, newCapacity);
+}
+~~~
+
+~~~ java
+private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
+
+private static int hugeCapacity(int minCapacity) {
+    //检查是否超出了 int 类型的长度 Interger.MAX_VALUE 出现了溢出 
+    if (minCapacity < 0) // overflow
+        throw new OutOfMemoryError();
+    //如果大于默认的最大数组长度,直接扩容到 Integer.MAX_VALUE 最大长度
+    return (minCapacity > MAX_ARRAY_SIZE) ?
+        Integer.MAX_VALUE :
+        MAX_ARRAY_SIZE;
+}
+~~~
+
+## 说说你对 ConcurrentHashMap 的理解
