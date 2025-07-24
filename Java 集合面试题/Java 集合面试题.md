@@ -460,3 +460,314 @@ private static int hugeCapacity(int minCapacity) {
 ~~~
 
 ## 说说你对 ConcurrentHashMap 的理解
+
+ ConcurrentHashMap 是一个线程安全的哈希表实现，其具有线程安全与高并发的特性。在 Java7 之前使用的是分段锁记住，底层将整个 HashMap 分为多个 Segment（默认是16个） 每一个 Segment 都是对应一个独立的锁，虽然通过不同的 Segment 进行了分区，对于不同的 Segment 可以进行并发的操作，但其并发度却受 Segment 制约，而在 Java8 当中取消了分段项，使用 CAS + synchronization 进行了优化，由于 1.8 版本当中 HashMap 的底层做了一些改变，使用 Node 数组 + 链表/红黑树的形式，所以 ConcurrentHashMap 底层也相应的做了调整。
+
+- **关键的操作方法**
+
+  ConcurrentHashMap 当中存在大量的 CAS 操作，比如在表初始化阶段，当命中的桶下标元素为空在插入元素的阶段，都使用了执行效率更高，不需要进行锁释放和获取的 CAS,从而减少了上下文的切换开销，而对于桶下标元素不为空的情况下，由于中间对于链表或红黑树的操作比较复杂，无法通过单个 CAS 进行原子性的操作因此通过 synchronized 代码块进行通过加锁，由于 Java 的synchronized 经过了多次的优化，在低竞争的情况下性能接近与 CAS ，在高竞争时同样又能保证线程的安全性，同样在锁的粒度上，synchronization 的加锁对象为当前的桶下标首节点元素，因此对于其他的节点并不会造成竞争影响。
+
+~~~ java
+final V putVal(K key, V value, boolean onlyIfAbsent) {
+        if (key == null || value == null) throw new NullPointerException();
+        int hash = spread(key.hashCode());
+        int binCount = 0;
+        for (Node<K,V>[] tab = table;;) {
+            Node<K,V> f; int n, i, fh;
+            if (tab == null || (n = tab.length) == 0)
+                tab = initTable(); //初始化阶段通过 CAS 进行桶的大小的分配和初始化
+            else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {
+                if (casTabAt(tab, i, null, //如果桶下标的首个节点元素为 NULL ,则直接通过 CAS 进行首个元素的插入
+                             new Node<K,V>(hash, key, value, null)))
+                    break;                   // no lock when adding to empty bin
+            }
+            else if ((fh = f.hash) == MOVED)
+                tab = helpTransfer(tab, f); //通过其他线程进行桶扩容以及数据迁移
+            else {
+                V oldVal = null;
+                synchronized (f) { // synchronized 对桶下标的首个元素加锁
+                    if (tabAt(tab, i) == f) {
+                        if (fh >= 0) {
+                            binCount = 1;
+                            for (Node<K,V> e = f;; ++binCount) {
+                                K ek;
+                                if (e.hash == hash &&
+                                    ((ek = e.key) == key ||
+                                     (ek != null && key.equals(ek)))) {
+                                    oldVal = e.val;
+                                    if (!onlyIfAbsent)
+                                        e.val = value;
+                                    break;
+                                }
+                                Node<K,V> pred = e;
+                                if ((e = e.next) == null) {
+                                    pred.next = new Node<K,V>(hash, key,
+                                                              value, null);
+                                    break;
+                                }
+                            }
+                        }
+                        else if (f instanceof TreeBin) {
+                            Node<K,V> p;
+                            binCount = 2;
+                            if ((p = ((TreeBin<K,V>)f).putTreeVal(hash, key,
+                                                           value)) != null) {
+                                oldVal = p.val;
+                                if (!onlyIfAbsent)
+                                    p.val = value;
+                            }
+                        }
+                    }
+                }
+                if (binCount != 0) {
+                    if (binCount >= TREEIFY_THRESHOLD)
+                        treeifyBin(tab, i);
+                    if (oldVal != null)
+                        return oldVal;
+                    break;
+                }
+            }
+        }
+        addCount(1L, binCount);
+        return null;
+    }
+~~~
+
+~~~ java
+//当发现某个桶已经被标记为 ForwardingNode（表示正在扩容）时，当前线程会尝试协助完成扩容过程。
+final Node<K,V>[] helpTransfer(Node<K,V>[] tab, Node<K,V> f) {
+    Node<K,V>[] nextTab; int sc;
+    // 检查条件：表不为空，且节点是ForwardingNode，且nextTable存在
+    if (tab != null && (f instanceof ForwardingNode) &&
+        (nextTab = ((ForwardingNode<K,V>)f).nextTable) != null) {
+        
+        // 计算扩容标识戳
+        int rs = resizeStamp(tab.length) << RESIZE_STAMP_SHIFT;
+        
+        // 循环检查扩容状态
+        while (nextTab == nextTable && table == tab &&
+               (sc = sizeCtl) < 0) {
+            
+            // 检查是否已经达到最大扩容线程数或扩容已完成
+            if (sc == rs + MAX_RESIZERS || sc == rs + 1 ||
+                transferIndex <= 0)
+                break;
+                
+            // CAS尝试增加扩容线程数
+            if (U.compareAndSwapInt(this, SIZECTL, sc, sc + 1)) {
+                transfer(tab, nextTab); // 执行实际的数据迁移
+                break;
+            }
+        }
+        return nextTab;
+    }
+    return table;
+}
+~~~
+
+## 关于 ConcurrentHashMap 的扩容你知道多少
+
+由于 ConcurrentHashMap  是线程安全的哈希表吗，因此其扩容过程要比 HashMap 要更加的复杂一些。ConcurrentHashMap  **并不是一次性就扩容**完成整个表，而是**逐步完成，每一次仅仅只是扩容一部分桶**，减少单词的扩容开销，具体代码如下，从代码当中可以看到会有**多线程协助扩容**，当有线程进行 put 操作时发现正在扩容，会协助进行数据的迁移，**而对于扩容的时机其实与 HashMap 是一样的**，会更具元素数量是否超过容量x负载因子，以及首次出现单链表长度超过阈值 8 并且表长度小于 64 时进行扩容。
+
+~~~ java
+// 在新增元素过程当中调用检查以及扩容方法
+final V putVal(K key, V value, boolean onlyIfAbsent) {
+    // ... 省略部分代码
+    
+    for (Node<K,V>[] tab = table;;) {
+        Node<K,V> f; int n, i, fh;
+        if (tab == null || (n = tab.length) == 0)
+            tab = initTable();
+        else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {
+            // ... 处理空桶
+        }
+        else if ((fh = f.hash) == MOVED)  // 检测到扩容标志
+            tab = helpTransfer(tab, f);   // 协助扩容
+        else {
+            // ... 处理键冲突
+        }
+    }
+    
+    // 检查是否需要扩容
+    if (binCount != 0) {
+        if (binCount >= TREEIFY_THRESHOLD)
+            treeifyBin(tab, i);
+        if (oldVal != null)
+            return oldVal;
+        break;
+    }
+}
+addCount(1L, binCount);  // 这里会检查是否需要扩容
+~~~
+
+~~~ java
+//进行检查是否需要扩容
+private final void addCount(long x, int check) {
+    // ... 计数逻辑
+    
+    if (check >= 0) {
+        Node<K,V>[] tab, nt; int n, sc;
+        while (s >= (long)(sc = sizeCtl) && (tab = table) != null &&
+               (n = tab.length) < MAXIMUM_CAPACITY) {
+            int rs = resizeStamp(n);
+            if (sc < 0) {  // 已经有线程在扩容
+                if ((sc >>> RESIZE_STAMP_SHIFT) != rs || sc == rs + 1 ||
+                    sc == rs + MAX_RESIZERS || (nt = nextTable) == null ||
+                    transferIndex <= 0)
+                    break;
+                if (U.compareAndSwapInt(this, SIZECTL, sc, sc + 1))
+                    transfer(tab, nt);  // 协助扩容
+            }
+            else if (U.compareAndSwapInt(this, SIZECTL, sc,
+                                         (rs << RESIZE_STAMP_SHIFT) + 2))
+                transfer(tab, null);  // 发起扩容
+            s = sumCount();
+        }
+    }
+}
+~~~
+
+~~~ java
+//进行扩容
+private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
+    int n = tab.length, stride;
+    // 计算每个线程处理的桶区间大小
+    if ((stride = (NCPU > 1) ? (n >>> 3) / NCPU : n) < MIN_TRANSFER_STRIDE)
+        stride = MIN_TRANSFER_STRIDE; // 最小16
+    
+    if (nextTab == null) {  // 初始化新数组
+        try {
+            @SuppressWarnings("unchecked")
+            Node<K,V>[] nt = (Node<K,V>[])new Node<?,?>[n << 1];  // 两倍扩容
+            nextTab = nt;
+        } catch (Throwable ex) {
+            sizeCtl = Integer.MAX_VALUE;
+            return;
+        }
+        nextTable = nextTab;
+        transferIndex = n;  // 迁移开始索引
+    }
+    
+    int nextn = nextTab.length;
+    ForwardingNode<K,V> fwd = new ForwardingNode<K,V>(nextTab);  // 转发节点
+    
+    boolean advance = true;
+    boolean finishing = false; // 完成标志
+    
+    // 分段迁移数据
+    for (int i = 0, bound = 0;;) {
+        Node<K,V> f; int fh;
+        while (advance) {
+            int nextIndex, nextBound;
+            if (--i >= bound || finishing)
+                advance = false;
+            else if ((nextIndex = transferIndex) <= 0) {
+                i = -1;
+                advance = false;
+            }
+            else if (U.compareAndSwapInt(
+                     this, TRANSFERINDEX, nextIndex,
+                     nextBound = (nextIndex > stride ?
+                                  nextIndex - stride : 0))) {
+                bound = nextBound;
+                i = nextIndex - 1;
+                advance = false;
+            }
+        }
+        
+        if (i < 0 || i >= n || i + n >= nextn) {
+            // ... 完成检查逻辑
+        }
+        else if ((f = tabAt(tab, i)) == null)
+            advance = casTabAt(tab, i, null, fwd);  // 标记为空桶已处理
+        else if ((fh = f.hash) == MOVED)
+            advance = true; // 已经处理过
+        else {
+            synchronized (f) {  // 锁定当前桶
+                if (tabAt(tab, i) == f) {
+                    Node<K,V> ln, hn;
+                    if (fh >= 0) {
+                        // ... 链表迁移逻辑
+                    }
+                    else if (f instanceof TreeBin) {
+                        // ... 树节点迁移逻辑
+                    }
+                }
+            }
+        }
+    }
+}
+~~~
+
+~~~ java
+//协助扩容
+final Node<K,V>[] helpTransfer(Node<K,V>[] tab, Node<K,V> f) {
+    Node<K,V>[] nextTab; int sc;
+    if (tab != null && (f instanceof ForwardingNode) &&
+        (nextTab = ((ForwardingNode<K,V>)f).nextTable) != null) {
+        int rs = resizeStamp(tab.length);
+        while (nextTab == nextTable && table == tab &&
+               (sc = sizeCtl) < 0) {
+            if ((sc >>> RESIZE_STAMP_SHIFT) != rs || sc == rs + 1 ||
+                sc == rs + MAX_RESIZERS || transferIndex <= 0)
+                break;
+            if (U.compareAndSwapInt(this, SIZECTL, sc, sc + 1)) {
+                transfer(tab, nextTab);  // 参与迁移
+                break;
+            }
+        }
+        return nextTab;
+    }
+    return table;
+}
+~~~
+
+## LinkedHashSet 集合你了解多少？他是怎么保证了元素的有序性的
+
+首先对于对于 Set 集合而言，其主要有以下
+
+1.  **HashSet**
+
+ `HashSet` 其底层由 **HashMap** 实现，元素作为 `HashMap` 的 key 而 value 使用了一个静态的 `PRESENT` 作为对象占位。
+
+~~~ java
+// HashSet 的部分源码
+public class HashSet<E> extends AbstractSet<E> implements Set<E> {
+    private transient HashMap<E,Object> map;
+    private static final Object PRESENT = new Object();
+    
+    public HashSet() {
+        map = new HashMap<>();
+    }
+    
+    public boolean add(E e) {
+        return map.put(e, PRESENT)==null;
+    }
+    
+    // 其他方法...
+}
+~~~
+
+2. **LinkedHashSet**
+
+​	LinkedHashSet 继承与 HashSet ，而内部使用的是 **LinkedHashMap** 作为其底层实现
+
+~~~ java
+public class LinkedHashSet<E> extends HashSet<E> implements Set<E> {
+    public LinkedHashSet() {
+        super(16, .75f, true); // 调用 HashSet 的特殊构造器
+    }
+}
+
+// HashSet 中的特殊构造器
+HashSet(int initialCapacity, float loadFactor, boolean dummy) {
+    map = new LinkedHashMap<>(initialCapacity, loadFactor);
+}
+~~~
+
+以及还有 **TreeSet**、**CopyOnWriteArrySet**、**ConcurrentSkipListSet** 而这些底层都是分别是基于 **TreeMap**、**CopyOnWriteArrayList**、**ConcurrentSkipListMap** 来实现完成，因此以上的集合的原理都大致是相似的，都是在原有的底层集合上的功能扩展。
+
+而之所以 `LinkedHashSet` 是有序的是由于本身底层的是基于`LinkedHashMap ` 的而 `LinkedHashMap ` 本身就是由双向链表进行维护的，每一个元素之间通过链表链接，保证了插入元素的有序性。
+
+
+
