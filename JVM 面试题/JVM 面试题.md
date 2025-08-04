@@ -129,8 +129,96 @@ if (ref != null) {
 
 ## 为什么会有双亲委派机制以及如何打破双亲委派
 
-在理解双亲委派之前，我们可能需要先了解一个类文件从编写到运行一直到最终卸载的整个生命周期，首先一个类文件从我们编写到运行一直到整个程序结束，在这个过程当中它需要经历 `.java 文件 → javac 编译 → .class 字节码 → 类加载（加载→链接→初始化）→ JVM 执行 → 卸载` 这个的一个完整过程。
+-  什么是双亲委派模型
 
-前面的三个阶段可以说都是准备阶段，其目的是要将编码的程序编译为一个由 JVM  运行的 class 文件、而在最终的类加载阶段才会根据类的全限定名进行包路径扫描，加载指定的 .class 文件并将其转化为了 JVM 内部的 Class 对象，将其对象存储在方法区。
+双亲委派可以理解为一种类的保护机制，通过对类加载的优先级控制从而确保核心类会被优先的加载，避免低优先级类将器高优先级类覆盖，防止重复的加载，从而保护核心类库的安全，确保 Java 运行时环境的稳定性。
 
-而在类加载的过程当中内部又分为 `加载`、`链接`、`初始化` 三个阶段，在这
+举一个例子来说，比如类 java.lang.Object ，它存放在 rt.jar 之中，无论哪一个类加载都是需要加载这个类的，**最终都是委派给处于模型最顶端的启动类加载器进行加载**，因为 Object 类在程序的各种类加载器环境中都能够保证是同一个类。反之，如果没有双亲委派模型，都有各个类加载器自行加载的话，如果用户自己也编写了一个名为 java.long.Object 的类，并放在了程序的 ClassPath 中，系统当中就会出现多个不同的 Object 类，会导致 JDK 最基础的包都会产生混乱。
+
+~~~ java
+protected Class<?> loadClass(String name, boolean resolve)
+throws ClassNotFoundException
+{
+    synchronized (getClassLoadingLock(name)) {
+        // 首先，检查请求的类是否已经被加载过
+        Class<?> c = findLoadedClass(name);
+        if (c == null) {
+            long t0 = System.nanoTime();
+            try {
+                //判断是否有父类存在
+                if (parent != null) {
+                    c = parent.loadClass(name, false);
+                } else {
+                    c = findBootstrapClassOrNull(name);
+                }
+            } catch (ClassNotFoundException e) {
+                // ClassNotFoundException thrown if class not found
+                // from the non-null parent class loader
+            }
+
+            if (c == null) {
+                // If still not found, then invoke findClass in order
+                // to find the class.
+                long t1 = System.nanoTime();
+                //如果父类加载器无法加载，就调用 findClass 
+                c = findClass(name);
+
+                // this is the defining class loader; record the stats
+                sun.misc.PerfCounter.getParentDelegationTime().addTime(t1 - t0);
+                sun.misc.PerfCounter.getFindClassTime().addElapsedTimeFrom(t1);
+                sun.misc.PerfCounter.getFindClasses().increment();
+            }
+        }
+        if (resolve) {
+            resolveClass(c);
+        }
+        return c;
+    }
+}
+~~~
+
+- 历史上有哪些打破双亲策略情况
+
+前面说的到双亲委派模型其实并不是一个强制性约束的模块，而是 Java 设计者推荐给开发者们的类加载器的实现方式。包括 Jdk 官方在历史上也是出现过 **3次较大型的“破环情况”**，这里的破环并不是完全的废弃，其实是值在某些特定的情况下，不得不绕过或调整双亲委派机制。
+
+1. **Jdk 1.2 引入双亲委派模型之前**，没有严格的双亲委派，而是由各个类加载器自定决定加载策略的，这就导致了一些问题，比如说，用户自定义的类可以轻易的覆盖核心类，破环了 JVM 的安全性。而同一个类可能被不同的类加载器重复的加载.
+
+2. **JNDI 和 SPI技术的引入**，需要动态的加载厂家提供的实现类，比如常见的 **JDBC、JCE** 加载。问题是核心接口（比如 javax.sql.DataSource) 是由 `Bootstrap ClassLodaer` 加载，但是实现类(比如:MySQL JDBC Driver) 在应用 `classpath` 下应由 `AppClassLoader` 加载，按照双亲委派，父加载器无法访问子类加载器，导致 SPI 实现类无法被加载。
+
+   为了解决这个问题，JDK 引入了线程的上下文加载器(Thread Context ClassLoader),而 `Thread.currentThread().setContextClassLoader()`允许 **父类加载器(如:Bootstartp)通过子加载器(如:AppClassLoader)加载类，** 从而绕过双亲委派。可以说，这是最经典的破环 **双亲委派** 的案例了。
+
+   ~~~ java
+   // JDBC 加载 Driver 时，DriverManager 使用 TCCL 加载实现类
+   Connection conn = DriverManager.getConnection("jdbc:mysql://localhost:3306/test");
+   ~~~
+
+3. **OSGi（模块化动态加载)**,其实这个很好理解就是，OSGI 需要支持模型库化，热部署，不用的模块之间依赖不同，比如现在使用的  IDEA 的插件系统，但问题是双亲委派的模块本身就是一个 **树状的父子依赖结构** ，而 OSGI 需要的是一种模块之间相互依赖的 **网状结构**，并且由于是插件，需要灵活的加载自己的类，如果遵循严格的双亲委派机制，就会导致无法灵活加载。
+
+   为了解决上述出现的问题，最终定义了每一个 Bundle 插件都是有属于自己的类加载器，采用 **先加载自己，再委托** 的策略，具体就是先检查自己的 Bundle 是否已经加载该类，如果没有则检查依赖的 Bundle 而不是直接就交给父加载器处理，最终才是走双亲委派。这样就可以保证插件可以独立加载不同版本的类，而不出现冲突。
+
+- 如何打破双亲委派
+
+  其实上面的提到的三种历史上的重大打破的情况就是打破双亲委派的方式，比如,线程上下文类加载器，通过 `Thread.currentThread().setContextClassLoader()` 设置上下文类加载器，绕过双亲委派,或者自定义类加载器并重写 `loadClass()`。
+
+  ~~~ java
+  // JDBC 驱动加载时，DriverManager 使用线程上下文类加载器加载实现类
+  Class.forName("com.mysql.jdbc.Driver");
+  ~~~
+
+  ~~~ java
+  public class MyClassLoader extends ClassLoader {
+      @Override
+      public Class<?> loadClass(String name) throws ClassNotFoundException {
+          // 先检查是否已加载
+          Class<?> c = findLoadedClass(name);
+          if (c != null) return c;
+          
+          // 如果是特定包，自己加载（打破双亲委派）
+          if (name.startsWith("com.myapp")) {
+              return findClass(name);
+          }
+          // 否则仍走双亲委派
+          return super.loadClass(name);
+      }
+  }
+  ~~~
