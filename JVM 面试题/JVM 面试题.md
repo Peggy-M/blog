@@ -135,40 +135,9 @@ if (ref != null) {
 
  ![JVM 内存模型](JVM 面试题.assets/JVM 内存模型.png)
 
-其实要理解 JVM 的内存模型，只要搞清楚一个对象的生命周期，在整个 JVM 当中如何流转即可。所以就从一个对象的诞生和灭亡讲起，对于绝大多数的非脚本性语言，都是从一个 main 方法开始或启动的。在 main 方法当中嵌套我们的开法业务框架的启动，子嵌套当中存在我们的业务逻辑代码。当程序在执行的过程当中，只要创建对象，就会涉及到类的加载以及内存的分配，以及对象的生命周期管理。
+- **程序计数器**
 
-- **从 SpringBoot 的启动类走进 JVM** 
+可以看作是一个当前线程所执行的字节码行号指示器,而字节码指示器工作就是通过改变计数器的值来选取吓一条需要执行的字节码指令，对于程序当中所有的逻辑流程跳转以及线程的恢复都是依赖于计数器完成的。比如说对于单核处理器，多线程任务来说，任何一确定的时刻都只会执行一个线程当中的指令。因此，要想其线程切换之后能恢复到之前的正确位置，必须依赖每一个线程的程序计数器，所以各个线程的程序计数器之间互不影响，独立存储。需要注意的是如果，当前执行的是一个 Java 方法，计数器记录的位置就是当前虚拟机字节码指令的地址，该地址是由虚拟机动态分配的。如果执行的是本地的 Native 方法，则这个计数器值则为空。
 
-~~~ java
-// User.java
-public class User {
-    private String name;
-    private static int userCount;
-    
-    public User(String name) {
-        this.name = name;
-        userCount++;
-    }
-}
-
-// Application.java
-@SpringBootApplication
-public class Application {
-    private static final Logger LOG = LoggerFactory.getLogger(Application.class);
-    
-    public static void main(String[] args) {
-        SpringApplication.run(Application.class, args);
-        User user = new User("Alice");
-        LOG.info("User created: " + user);
-    }
-}
-~~~
-
-这是一个常见的 SpringBoot 项目的启动类，从代码编写之后，开始运行该程序一共需要经历 `编译`、`类加载`、`运行时内存分配`、`内存回收` 这样大致四个阶段，当然这四个阶段内部又有其很多具体的细节。
-
-**编译阶段**
-
-编译器首先会将源代码转为抽象的语法树，并同时检查其语法是否符合规范，将并其源代码转为包含，版本信息、常量池、访问标志以及魔术等类中完整信息，而对于一类而言会生成单独的 class 文件，对于内部类则通过父类&子类的形式进行命名 class 。
-
-**类加载阶段**
+- Java 虚拟机栈
 
